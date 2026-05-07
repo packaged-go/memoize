@@ -37,6 +37,14 @@
 //	user, err := cache.Get("user:123")
 //	user, err = cache.Get("user:123", memoize.NoParams())
 //
+// WithDebugging attaches a zap logger for debug-level trace events covering
+// cache hits, misses, refreshes, stale returns, source calls, invalidation, and
+// cleanup:
+//
+//	cache := memoize.NewKeyed[string, User](loadUser,
+//		memoize.WithDebugging(logger),
+//	)
+//
 // Errors can opt into a specific cache duration by returning
 // memoize.WithErrorTTL(err, ttl). Unwrapped errors use the configured maximum
 // error TTL.

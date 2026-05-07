@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/packaged-go/memoize"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type params struct {
@@ -147,6 +149,85 @@ func TestOmittedNilableParamsPassNil(t *testing.T) {
 	}
 	if v != 3 {
 		t.Fatalf("expected nil params to produce 3, got %d", v)
+	}
+}
+
+func TestWithDebuggingLogsRequestFlow(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
+	logger := zap.New(core)
+	release := make(chan struct{})
+	var calls int32
+
+	m := memoize.New[string, int, memoize.Params](
+		func(ctx context.Context, key string, p memoize.Params) (int, error) {
+			call := atomic.AddInt32(&calls, 1)
+			if call == 2 {
+				<-release
+			}
+			return int(call), nil
+		},
+		memoize.WithMinimumTTL(time.Millisecond),
+		memoize.WithMaximumTTL(time.Hour),
+		memoize.WithMaximumResponseTime(time.Millisecond),
+		memoize.WithDebugging(logger),
+	)
+	defer m.Close()
+
+	v, err := m.Get("route-a")
+	if err != nil {
+		t.Fatalf("unexpected prime error: %v", err)
+	}
+	if v != 1 {
+		t.Fatalf("expected first value 1, got %d", v)
+	}
+
+	v, err = m.Get("route-a")
+	if err != nil {
+		t.Fatalf("unexpected cache hit error: %v", err)
+	}
+	if v != 1 {
+		t.Fatalf("expected cached value 1, got %d", v)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	v, err = m.Get("route-a")
+	if err != nil {
+		t.Fatalf("unexpected stale return error: %v", err)
+	}
+	if v != 1 {
+		t.Fatalf("expected stale value 1, got %d", v)
+	}
+	close(release)
+
+	deadline := time.Now().Add(time.Second)
+	for atomic.LoadInt32(&calls) < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	entries := logs.All()
+	messages := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		messages[entry.Message] = true
+		if entry.Message == "memoize.request.start" {
+			if got := entry.ContextMap()["route"]; got != "route-a" {
+				t.Fatalf("expected route field route-a, got %v", got)
+			}
+		}
+	}
+
+	for _, message := range []string{
+		"memoize.request.start",
+		"memoize.cache.miss",
+		"memoize.call.start",
+		"memoize.source.start",
+		"memoize.source.finish",
+		"memoize.source.result",
+		"memoize.cache.hit",
+		"memoize.stale.return",
+	} {
+		if !messages[message] {
+			t.Fatalf("expected debug log %q in %#v", message, messages)
+		}
 	}
 }
 

@@ -1,6 +1,10 @@
 package memoize
 
-import "time"
+import (
+	"time"
+
+	"go.uber.org/zap"
+)
 
 type options struct {
 	minTTL          time.Duration // minTTL is the period after a successful fetch where cached values are returned
@@ -9,6 +13,7 @@ type options struct {
 	hardTimeout     time.Duration // hardTimeout is the maximum time a source call may run before its context is cancelled
 	maxErrorTTL     time.Duration // maxErrorTTL is the default and upper bound TTL for cached errors
 	cleanupInterval time.Duration // cleanupInterval is how frequently expired entries are removed from memory. A non-positive interval disables background cleanup.
+	debugLogger     *zap.Logger   // debugLogger receives structured trace events when configured.
 }
 
 func defaultOptions() options {
@@ -68,5 +73,13 @@ func WithMaximumErrorTTL(ttl time.Duration) Option {
 func WithCleanupInterval(interval time.Duration) Option {
 	return func(o *options) {
 		o.cleanupInterval = interval
+	}
+}
+
+// WithDebugging enables structured debug logs for memoizer state transitions.
+// Passing nil disables debug logging.
+func WithDebugging(logger *zap.Logger) Option {
+	return func(o *options) {
+		o.debugLogger = logger
 	}
 }

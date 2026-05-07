@@ -3,8 +3,11 @@ package memoize
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 // SourceFunc fetches a value for key using caller-supplied params.
@@ -113,6 +116,7 @@ func (m *Memoizer[K, V, P]) Close() {
 	m.closeOnce.Do(func() {
 		m.mu.Lock()
 		m.isClosed = true
+		inFlight := len(m.calls)
 		for _, c := range m.calls {
 			c.cancel()
 		}
@@ -121,31 +125,39 @@ func (m *Memoizer[K, V, P]) Close() {
 
 		m.cancel()
 		close(m.closed)
+		m.debug("memoize.close", zap.Int("in_flight", inFlight))
 	})
 
 	m.wg.Wait()
+	m.debug("memoize.close.complete")
 }
 
 // Delete removes key from the cache.
 func (m *Memoizer[K, V, P]) Delete(key K) {
 	m.mu.Lock()
+	_, hadEntry := m.entries[key]
 	if _, hasCall := m.calls[key]; hasCall {
 		m.versions[key]++
 	} else {
 		delete(m.versions, key)
 	}
+	_, hasCall := m.calls[key]
 	delete(m.entries, key)
 	m.mu.Unlock()
+	m.debugForKey("memoize.delete", key, zap.Bool("had_entry", hadEntry), zap.Bool("has_in_flight_call", hasCall))
 }
 
 // Clear removes all cached entries. In-flight calls are not cancelled, but
 // their eventual results will not repopulate the cache.
 func (m *Memoizer[K, V, P]) Clear() {
 	m.mu.Lock()
+	entries := len(m.entries)
+	calls := len(m.calls)
 	m.clearGen++
 	m.entries = make(map[K]entry[V])
 	m.versions = make(map[K]uint64)
 	m.mu.Unlock()
+	m.debug("memoize.clear", zap.Int("entries", entries), zap.Int("in_flight_calls", calls))
 }
 
 // Len returns the number of cached entries currently held in memory.
@@ -162,10 +174,12 @@ func (m *Memoizer[K, V, P]) Extend(key K, ttl time.Duration) error {
 
 	ent, ok := m.entries[key]
 	if !ok {
+		m.debugForKey("memoize.extend.miss", key, zap.Duration("ttl", ttl))
 		return ErrNotFound
 	}
 	ent.expiresAt = time.Now().Add(ttl)
 	m.entries[key] = ent
+	m.debugForKey("memoize.extend", key, zap.Duration("ttl", ttl), zap.Time("expires_at", ent.expiresAt))
 	return nil
 }
 
@@ -185,6 +199,7 @@ func (m *Memoizer[K, V, P]) Cleanup() int {
 	removed += m.cleanupExpiredCallsLocked(now)
 	m.mu.Unlock()
 
+	m.debug("memoize.cleanup", zap.Int("removed", removed))
 	return removed
 }
 
@@ -196,23 +211,67 @@ func optionalParam[P any](params []P) P {
 	return p
 }
 
+func (m *Memoizer[K, V, P]) debug(message string, fields ...zap.Field) {
+	if m.opts.debugLogger == nil {
+		return
+	}
+	m.opts.debugLogger.Debug(message, fields...)
+}
+
+func (m *Memoizer[K, V, P]) debugForKey(message string, key K, fields ...zap.Field) {
+	if m.opts.debugLogger == nil {
+		return
+	}
+	base := []zap.Field{
+		zap.String("route", fmt.Sprint(key)),
+		zap.Any("key", key),
+	}
+	m.opts.debugLogger.Debug(message, append(base, fields...)...)
+}
+
 func (m *Memoizer[K, V, P]) get(key K, params P, waitForFresh bool) (V, error) {
 	now := time.Now()
+	operation := "get"
+	if waitForFresh {
+		operation = "get_fresh"
+	}
+	m.debugForKey("memoize.request.start", key,
+		zap.String("operation", operation),
+		zap.Any("params", params),
+		zap.Duration("min_ttl", m.opts.minTTL),
+		zap.Duration("max_ttl", m.opts.maxTTL),
+		zap.Duration("max_response_time", m.opts.maxResponseTime),
+		zap.Duration("hard_timeout", m.opts.hardTimeout),
+	)
 
 	m.mu.Lock()
 	if m.isClosed {
 		m.mu.Unlock()
 		var zero V
+		m.debugForKey("memoize.request.closed", key, zap.String("operation", operation))
 		return zero, ErrClosed
 	}
 
 	ent, hasEntry := m.entries[key]
 	if hasEntry && ent.err == nil && now.Before(ent.fetchedAt.Add(m.opts.minTTL)) && now.Before(ent.expiresAt) {
 		m.mu.Unlock()
+		m.debugForKey("memoize.cache.hit", key,
+			zap.String("operation", operation),
+			zap.String("reason", "within_min_ttl"),
+			zap.Time("fetched_at", ent.fetchedAt),
+			zap.Time("expires_at", ent.expiresAt),
+		)
 		return ent.value, nil
 	}
 	if hasEntry && ent.err != nil && now.Before(ent.expiresAt) {
 		m.mu.Unlock()
+		m.debugForKey("memoize.cache.hit", key,
+			zap.String("operation", operation),
+			zap.String("reason", "cached_error"),
+			zap.Error(ent.err),
+			zap.Time("fetched_at", ent.fetchedAt),
+			zap.Time("expires_at", ent.expiresAt),
+		)
 		return ent.value, ent.err
 	}
 
@@ -221,17 +280,32 @@ func (m *Memoizer[K, V, P]) get(key K, params P, waitForFresh bool) (V, error) {
 	m.mu.Unlock()
 
 	if !hasEntry {
+		m.debugForKey("memoize.cache.miss", key, zap.String("operation", operation))
 		return m.waitForColdMiss(c)
 	}
 
 	if waitForFresh {
+		m.debugForKey("memoize.refresh.wait", key,
+			zap.String("operation", operation),
+			zap.Bool("stale_available", staleOK),
+		)
 		return m.waitForFresh(c, ent, staleOK)
 	}
 
 	if m.opts.maxResponseTime <= 0 {
 		if staleOK {
+			m.debugForKey("memoize.stale.return", key,
+				zap.String("operation", operation),
+				zap.String("reason", "max_response_time_disabled"),
+				zap.Time("fetched_at", ent.fetchedAt),
+				zap.Time("expires_at", ent.expiresAt),
+			)
 			return ent.value, nil
 		}
+		m.debugForKey("memoize.refresh.wait", key,
+			zap.String("operation", operation),
+			zap.Bool("stale_available", false),
+		)
 		return m.waitForColdMiss(c)
 	}
 
@@ -240,11 +314,28 @@ func (m *Memoizer[K, V, P]) get(key K, params P, waitForFresh bool) (V, error) {
 
 	select {
 	case <-c.done:
+		m.debugForKey("memoize.refresh.return", key,
+			zap.String("operation", operation),
+			zap.Duration("waited", time.Since(now)),
+			zap.Error(c.err),
+		)
 		return c.value, c.err
 	case <-timer.C:
 		if staleOK {
+			m.debugForKey("memoize.stale.return", key,
+				zap.String("operation", operation),
+				zap.String("reason", "max_response_time_exceeded"),
+				zap.Duration("max_response_time", m.opts.maxResponseTime),
+				zap.Time("fetched_at", ent.fetchedAt),
+				zap.Time("expires_at", ent.expiresAt),
+			)
 			return ent.value, nil
 		}
+		m.debugForKey("memoize.refresh.wait", key,
+			zap.String("operation", operation),
+			zap.Bool("stale_available", false),
+			zap.String("reason", "max_response_time_exceeded_without_stale"),
+		)
 		return m.waitForColdMiss(c)
 	}
 }
@@ -275,6 +366,10 @@ func (m *Memoizer[K, V, P]) cleanupExpiredCallsLocked(now time.Time) int {
 			delete(m.calls, key)
 			m.cleanupVersionLocked(key)
 			removed++
+			m.debugForKey("memoize.call.cleanup_expired", key,
+				zap.Time("started_at", c.startedAt),
+				zap.Duration("hard_timeout", m.opts.hardTimeout),
+			)
 		}
 	}
 	return removed
@@ -291,10 +386,19 @@ func (m *Memoizer[K, V, P]) callExpiredAt(c *call[V], now time.Time) bool {
 func (m *Memoizer[K, V, P]) getOrStartCallLocked(key K, params P) *call[V] {
 	if c, ok := m.calls[key]; ok {
 		if !m.callExpired(c, time.Now()) {
+			m.debugForKey("memoize.call.join", key,
+				zap.Time("started_at", c.startedAt),
+				zap.Uint64("version", c.version),
+				zap.Uint64("clear_generation", c.clearGen),
+			)
 			return c
 		}
 		c.cancel()
 		delete(m.calls, key)
+		m.debugForKey("memoize.call.replace_expired", key,
+			zap.Time("started_at", c.startedAt),
+			zap.Duration("hard_timeout", m.opts.hardTimeout),
+		)
 	}
 
 	ctx := m.ctx
@@ -314,6 +418,12 @@ func (m *Memoizer[K, V, P]) getOrStartCallLocked(key K, params P) *call[V] {
 	}
 	m.calls[key] = c
 	m.wg.Add(1)
+	m.debugForKey("memoize.call.start", key,
+		zap.Time("started_at", c.startedAt),
+		zap.Uint64("version", c.version),
+		zap.Uint64("clear_generation", c.clearGen),
+		zap.Duration("hard_timeout", m.opts.hardTimeout),
+	)
 	go m.fetch(ctx, key, params, c)
 	return c
 }
@@ -322,6 +432,10 @@ func (m *Memoizer[K, V, P]) fetch(ctx context.Context, key K, params P, c *call[
 	defer m.wg.Done()
 	defer c.cancel()
 
+	m.debugForKey("memoize.source.start", key,
+		zap.Time("started_at", c.startedAt),
+		zap.Any("params", params),
+	)
 	value, err := m.source(ctx, key, params)
 	if err == nil && ctx.Err() != nil {
 		err = ctx.Err()
@@ -332,12 +446,22 @@ func (m *Memoizer[K, V, P]) fetch(ctx context.Context, key K, params P, c *call[
 
 	now := time.Now()
 	ent, cacheable := m.entryForResult(value, err, now)
+	m.debugForKey("memoize.source.finish", key,
+		zap.Duration("duration", now.Sub(c.startedAt)),
+		zap.Bool("cacheable", cacheable),
+		zap.Error(err),
+	)
 
 	m.mu.Lock()
+	cached := false
+	closed := m.isClosed
+	currentVersion := m.versions[key]
+	currentClearGen := m.clearGen
 	if cacheable && !m.isClosed && c.version == m.versions[key] && c.clearGen == m.clearGen {
 		currentEntry, hasCurrentEntry := m.entries[key]
 		if !hasCurrentEntry || !currentEntry.fetchedAt.After(c.startedAt) {
 			m.entries[key] = ent
+			cached = true
 		}
 	}
 	c.value = value
@@ -348,6 +472,16 @@ func (m *Memoizer[K, V, P]) fetch(ctx context.Context, key K, params P, c *call[
 	m.cleanupVersionLocked(key)
 	close(c.done)
 	m.mu.Unlock()
+	m.debugForKey("memoize.source.result", key,
+		zap.Bool("cached", cached),
+		zap.Bool("cacheable", cacheable),
+		zap.Bool("closed", closed),
+		zap.Uint64("call_version", c.version),
+		zap.Uint64("current_version", currentVersion),
+		zap.Uint64("call_clear_generation", c.clearGen),
+		zap.Uint64("current_clear_generation", currentClearGen),
+		zap.Error(err),
+	)
 }
 
 func (m *Memoizer[K, V, P]) cleanupVersionLocked(key K) {
