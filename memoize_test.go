@@ -48,6 +48,46 @@ func TestGetCachesWithinMinimumTTL(t *testing.T) {
 	}
 }
 
+func TestGetDoesNotRefreshWithinMinimumTTLAfterShortExtend(t *testing.T) {
+	var calls int32
+	m := memoize.New[string, int, struct{}](
+		func(ctx context.Context, key string, p struct{}) (int, error) {
+			return int(atomic.AddInt32(&calls, 1)), nil
+		},
+		memoize.WithMinimumTTL(time.Hour),
+		memoize.WithMaximumTTL(2*time.Hour),
+		memoize.WithCleanupInterval(0),
+	)
+	defer m.Close()
+
+	v, err := m.Get("k", struct{}{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != 1 {
+		t.Fatalf("expected first value 1, got %d", v)
+	}
+	if err := m.Extend("k", time.Nanosecond); err != nil {
+		t.Fatalf("extend cached value: %v", err)
+	}
+	time.Sleep(time.Millisecond)
+
+	if removed := m.Cleanup(); removed != 0 {
+		t.Fatalf("expected cleanup to preserve minimum-TTL entry, removed %d", removed)
+	}
+
+	v, err = m.Get("k", struct{}{})
+	if err != nil {
+		t.Fatalf("unexpected cached error: %v", err)
+	}
+	if v != 1 {
+		t.Fatalf("expected cached value 1, got %d", v)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected minimum TTL to prevent a second source call, got %d", got)
+	}
+}
+
 func TestGetAllowsOmittedParams(t *testing.T) {
 	var calls int32
 	m := memoize.New[string, int, memoize.Params](

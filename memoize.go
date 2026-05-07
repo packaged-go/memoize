@@ -191,7 +191,7 @@ func (m *Memoizer[K, V, P]) Cleanup() int {
 
 	m.mu.Lock()
 	for key, ent := range m.entries {
-		if !now.Before(ent.expiresAt) {
+		if m.entryExpired(ent, now) {
 			delete(m.entries, key)
 			removed++
 		}
@@ -253,7 +253,7 @@ func (m *Memoizer[K, V, P]) get(key K, params P, waitForFresh bool) (V, error) {
 	}
 
 	ent, hasEntry := m.entries[key]
-	if hasEntry && ent.err == nil && now.Before(ent.fetchedAt.Add(m.opts.minTTL)) && now.Before(ent.expiresAt) {
+	if hasEntry && m.entryWithinMinimumTTL(ent, now) {
 		m.mu.Unlock()
 		m.debugForKey("memoize.cache.hit", key,
 			zap.String("operation", operation),
@@ -373,6 +373,17 @@ func (m *Memoizer[K, V, P]) cleanupExpiredCallsLocked(now time.Time) int {
 		}
 	}
 	return removed
+}
+
+func (m *Memoizer[K, V, P]) entryWithinMinimumTTL(ent entry[V], now time.Time) bool {
+	return ent.err == nil && now.Before(ent.fetchedAt.Add(m.opts.minTTL))
+}
+
+func (m *Memoizer[K, V, P]) entryExpired(ent entry[V], now time.Time) bool {
+	if m.entryWithinMinimumTTL(ent, now) {
+		return false
+	}
+	return !now.Before(ent.expiresAt)
 }
 
 func (m *Memoizer[K, V, P]) callExpired(c *call[V], now time.Time) bool {
