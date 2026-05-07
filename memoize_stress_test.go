@@ -13,7 +13,7 @@ import (
 
 func TestStressCleanupPreventsEntryRetention(t *testing.T) {
 	const entries = 5000
-	m := New[string, struct{}, int](
+	m := New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			return 1, nil
 		},
@@ -49,7 +49,7 @@ func TestStressCleanupPreventsEntryRetention(t *testing.T) {
 
 func TestStressConcurrentAccessUnderRaceDetector(t *testing.T) {
 	var calls int64
-	m := New[int, struct{}, int](
+	m := New[int, int, struct{}](
 		func(ctx context.Context, key int, p struct{}) (int, error) {
 			atomic.AddInt64(&calls, 1)
 			time.Sleep(time.Microsecond)
@@ -106,7 +106,7 @@ func TestStressSingleflightPerKeyUnderLoad(t *testing.T) {
 	start := make(chan struct{})
 	var calls int64
 
-	m := New[string, struct{}, int](
+	m := New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			atomic.AddInt64(&calls, 1)
 			<-start
@@ -157,7 +157,7 @@ func TestStressTimedOutCallsAreReleased(t *testing.T) {
 	release := make(chan struct{})
 	var calls int64
 
-	m := New[int, struct{}, int](
+	m := New[int, int, struct{}](
 		func(ctx context.Context, key int, p struct{}) (int, error) {
 			atomic.AddInt64(&calls, 1)
 			<-release
@@ -202,7 +202,7 @@ func TestStressBackgroundCleanupKeepsCacheBounded(t *testing.T) {
 	const rounds = 8
 	const keysPerRound = 250
 
-	m := New[string, struct{}, int](
+	m := New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			return 1, nil
 		},
@@ -232,7 +232,7 @@ func TestStressBackgroundCleanupKeepsCacheBounded(t *testing.T) {
 }
 
 func BenchmarkGetHotCache(b *testing.B) {
-	m := New[string, struct{}, int](
+	m := New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			return 1, nil
 		},
@@ -256,7 +256,7 @@ func BenchmarkGetHotCache(b *testing.B) {
 }
 
 func BenchmarkGetHotCacheParallel(b *testing.B) {
-	m := New[int, struct{}, int](
+	m := New[int, int, struct{}](
 		func(ctx context.Context, key int, p struct{}) (int, error) {
 			return key, nil
 		},
@@ -286,7 +286,7 @@ func BenchmarkGetHotCacheParallel(b *testing.B) {
 }
 
 func BenchmarkGetColdDistinctKeys(b *testing.B) {
-	m := New[int, struct{}, int](
+	m := New[int, int, struct{}](
 		func(ctx context.Context, key int, p struct{}) (int, error) {
 			return key, nil
 		},

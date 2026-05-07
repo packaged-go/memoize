@@ -8,12 +8,15 @@ import (
 )
 
 // SourceFunc fetches a value for key using caller-supplied params.
-type SourceFunc[K comparable, P any, V any] func(context.Context, K, P) (V, error)
+type SourceFunc[K comparable, V any, P any] func(context.Context, K, P) (V, error)
+
+// KeySourceFunc fetches a value for key without caller-supplied params.
+type KeySourceFunc[K comparable, V any] func(context.Context, K) (V, error)
 
 // Memoizer caches source responses and coordinates refreshes so only one source
 // call for a key is active at a time.
-type Memoizer[K comparable, P any, V any] struct {
-	source SourceFunc[K, P, V]
+type Memoizer[K comparable, V any, P any] struct {
+	source SourceFunc[K, V, P]
 	opts   options
 
 	mu       sync.Mutex
@@ -48,7 +51,7 @@ type call[V any] struct {
 }
 
 // New creates a Memoizer for source.
-func New[K comparable, P any, V any](source SourceFunc[K, P, V], opts ...Option) *Memoizer[K, P, V] {
+func New[K comparable, V any, P any](source SourceFunc[K, V, P], opts ...Option) *Memoizer[K, V, P] {
 	cfg := defaultOptions()
 	for _, opt := range opts {
 		opt(&cfg)
@@ -58,7 +61,7 @@ func New[K comparable, P any, V any](source SourceFunc[K, P, V], opts ...Option)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &Memoizer[K, P, V]{
+	m := &Memoizer[K, V, P]{
 		source:   source,
 		opts:     cfg,
 		entries:  make(map[K]entry[V]),
@@ -74,25 +77,39 @@ func New[K comparable, P any, V any](source SourceFunc[K, P, V], opts ...Option)
 	return m
 }
 
+// NewKeyed creates a Memoizer for a source that only needs context and key.
+func NewKeyed[K comparable, V any](source KeySourceFunc[K, V], opts ...Option) *Memoizer[K, V, Params] {
+	return New[K, V, Params](
+		func(ctx context.Context, key K, _ Params) (V, error) {
+			return source(ctx, key)
+		},
+		opts...,
+	)
+}
+
 // Get returns a cached value when it is within the minimum TTL. Past that point
 // it starts or joins a single refresh call for the key. If that refresh does not
 // finish within the configured maximum response time, Get returns the stale
 // cached response as long as it has not passed the maximum TTL.
-func (m *Memoizer[K, P, V]) Get(key K, params P) (V, error) {
-	return m.get(key, params, false)
+//
+// If params is omitted, the source receives the zero value for P.
+func (m *Memoizer[K, V, P]) Get(key K, params ...P) (V, error) {
+	return m.get(key, optionalParam(params), false)
 }
 
 // GetFresh starts or joins a refresh once the cached response is outside the
 // minimum TTL, and waits for that refresh unless the context or hard timeout
 // expires. If a stale response is still inside the maximum TTL, it is returned
 // when the wait deadline is hit.
-func (m *Memoizer[K, P, V]) GetFresh(key K, params P) (V, error) {
-	return m.get(key, params, true)
+//
+// If params is omitted, the source receives the zero value for P.
+func (m *Memoizer[K, V, P]) GetFresh(key K, params ...P) (V, error) {
+	return m.get(key, optionalParam(params), true)
 }
 
 // Close stops the background cleanup process, cancels in-flight source calls,
 // and waits for those calls to return. Future Get calls return ErrClosed.
-func (m *Memoizer[K, P, V]) Close() {
+func (m *Memoizer[K, V, P]) Close() {
 	m.closeOnce.Do(func() {
 		m.mu.Lock()
 		m.isClosed = true
@@ -110,7 +127,7 @@ func (m *Memoizer[K, P, V]) Close() {
 }
 
 // Delete removes key from the cache.
-func (m *Memoizer[K, P, V]) Delete(key K) {
+func (m *Memoizer[K, V, P]) Delete(key K) {
 	m.mu.Lock()
 	if _, hasCall := m.calls[key]; hasCall {
 		m.versions[key]++
@@ -123,7 +140,7 @@ func (m *Memoizer[K, P, V]) Delete(key K) {
 
 // Clear removes all cached entries. In-flight calls are not cancelled, but
 // their eventual results will not repopulate the cache.
-func (m *Memoizer[K, P, V]) Clear() {
+func (m *Memoizer[K, V, P]) Clear() {
 	m.mu.Lock()
 	m.clearGen++
 	m.entries = make(map[K]entry[V])
@@ -132,14 +149,14 @@ func (m *Memoizer[K, P, V]) Clear() {
 }
 
 // Len returns the number of cached entries currently held in memory.
-func (m *Memoizer[K, P, V]) Len() int {
+func (m *Memoizer[K, V, P]) Len() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.entries)
 }
 
 // Extend extends the maximum usable lifetime for a cached key.
-func (m *Memoizer[K, P, V]) Extend(key K, ttl time.Duration) error {
+func (m *Memoizer[K, V, P]) Extend(key K, ttl time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -154,7 +171,7 @@ func (m *Memoizer[K, P, V]) Extend(key K, ttl time.Duration) error {
 
 // Cleanup removes expired cached entries and timed-out in-flight call records,
 // and returns the number removed.
-func (m *Memoizer[K, P, V]) Cleanup() int {
+func (m *Memoizer[K, V, P]) Cleanup() int {
 	now := time.Now()
 	removed := 0
 
@@ -171,7 +188,15 @@ func (m *Memoizer[K, P, V]) Cleanup() int {
 	return removed
 }
 
-func (m *Memoizer[K, P, V]) get(key K, params P, waitForFresh bool) (V, error) {
+func optionalParam[P any](params []P) P {
+	var p P
+	if len(params) > 0 {
+		p = params[0]
+	}
+	return p
+}
+
+func (m *Memoizer[K, V, P]) get(key K, params P, waitForFresh bool) (V, error) {
 	now := time.Now()
 
 	m.mu.Lock()
@@ -224,7 +249,7 @@ func (m *Memoizer[K, P, V]) get(key K, params P, waitForFresh bool) (V, error) {
 	}
 }
 
-func (m *Memoizer[K, P, V]) cleanupLoop() {
+func (m *Memoizer[K, V, P]) cleanupLoop() {
 	ticker := time.NewTicker(m.opts.cleanupInterval)
 	defer ticker.Stop()
 
@@ -238,7 +263,7 @@ func (m *Memoizer[K, P, V]) cleanupLoop() {
 	}
 }
 
-func (m *Memoizer[K, P, V]) cleanupExpiredCallsLocked(now time.Time) int {
+func (m *Memoizer[K, V, P]) cleanupExpiredCallsLocked(now time.Time) int {
 	if m.opts.hardTimeout <= 0 {
 		return 0
 	}
@@ -255,15 +280,15 @@ func (m *Memoizer[K, P, V]) cleanupExpiredCallsLocked(now time.Time) int {
 	return removed
 }
 
-func (m *Memoizer[K, P, V]) callExpired(c *call[V], now time.Time) bool {
+func (m *Memoizer[K, V, P]) callExpired(c *call[V], now time.Time) bool {
 	return m.opts.hardTimeout > 0 && m.callExpiredAt(c, now)
 }
 
-func (m *Memoizer[K, P, V]) callExpiredAt(c *call[V], now time.Time) bool {
+func (m *Memoizer[K, V, P]) callExpiredAt(c *call[V], now time.Time) bool {
 	return !now.Before(c.startedAt.Add(m.opts.hardTimeout))
 }
 
-func (m *Memoizer[K, P, V]) getOrStartCallLocked(key K, params P) *call[V] {
+func (m *Memoizer[K, V, P]) getOrStartCallLocked(key K, params P) *call[V] {
 	if c, ok := m.calls[key]; ok {
 		if !m.callExpired(c, time.Now()) {
 			return c
@@ -293,7 +318,7 @@ func (m *Memoizer[K, P, V]) getOrStartCallLocked(key K, params P) *call[V] {
 	return c
 }
 
-func (m *Memoizer[K, P, V]) fetch(ctx context.Context, key K, params P, c *call[V]) {
+func (m *Memoizer[K, V, P]) fetch(ctx context.Context, key K, params P, c *call[V]) {
 	defer m.wg.Done()
 	defer c.cancel()
 
@@ -325,7 +350,7 @@ func (m *Memoizer[K, P, V]) fetch(ctx context.Context, key K, params P, c *call[
 	m.mu.Unlock()
 }
 
-func (m *Memoizer[K, P, V]) cleanupVersionLocked(key K) {
+func (m *Memoizer[K, V, P]) cleanupVersionLocked(key K) {
 	if _, hasEntry := m.entries[key]; hasEntry {
 		return
 	}
@@ -335,7 +360,7 @@ func (m *Memoizer[K, P, V]) cleanupVersionLocked(key K) {
 	delete(m.versions, key)
 }
 
-func (m *Memoizer[K, P, V]) entryForResult(value V, err error, now time.Time) (entry[V], bool) {
+func (m *Memoizer[K, V, P]) entryForResult(value V, err error, now time.Time) (entry[V], bool) {
 	if err == nil {
 		return entry[V]{
 			value:     value,
@@ -366,7 +391,7 @@ func (m *Memoizer[K, P, V]) entryForResult(value V, err error, now time.Time) (e
 	}, true
 }
 
-func (m *Memoizer[K, P, V]) waitForColdMiss(c *call[V]) (V, error) {
+func (m *Memoizer[K, V, P]) waitForColdMiss(c *call[V]) (V, error) {
 	if m.opts.hardTimeout > 0 {
 		return waitWithHardTimeout(c, m.opts.hardTimeout, entry[V]{}, false)
 	}
@@ -375,7 +400,7 @@ func (m *Memoizer[K, P, V]) waitForColdMiss(c *call[V]) (V, error) {
 	return c.value, c.err
 }
 
-func (m *Memoizer[K, P, V]) waitForFresh(c *call[V], stale entry[V], staleOK bool) (V, error) {
+func (m *Memoizer[K, V, P]) waitForFresh(c *call[V], stale entry[V], staleOK bool) (V, error) {
 	if m.opts.hardTimeout > 0 {
 		return waitWithHardTimeout(c, m.opts.hardTimeout, stale, staleOK)
 	}

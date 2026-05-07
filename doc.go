@@ -12,7 +12,7 @@
 //		Region string
 //	}
 //
-//	cache := memoize.New[string, LookupParams, User](loadUser,
+//	cache := memoize.New[string, User, LookupParams](loadUser,
 //		memoize.WithMinimumTTL(30*time.Second),
 //		memoize.WithMaximumTTL(5*time.Minute),
 //		memoize.WithMaximumResponseTime(50*time.Millisecond),
@@ -20,6 +20,22 @@
 //	)
 //
 //	user, err := cache.Get("user:123", LookupParams{Region: "eu"})
+//
+// Params are optional at call time. When omitted, the source receives the zero
+// value for the params type. For key-only sources, use NewKeyed:
+//
+//	cache := memoize.NewKeyed[string, User](loadUser)
+//	user, err := cache.Get("user:123")
+//
+// If the params type is nilable, such as *LookupParams or any, an omitted
+// params argument is passed to the source as nil.
+//
+// The package Params type can be used when a source wants optional dynamic
+// params without defining a custom params struct:
+//
+//	cache := memoize.New[string, User, memoize.Params](loadUser)
+//	user, err := cache.Get("user:123")
+//	user, err = cache.Get("user:123", memoize.NoParams())
 //
 // Errors can opt into a specific cache duration by returning
 // memoize.WithErrorTTL(err, ttl). Unwrapped errors use the configured maximum

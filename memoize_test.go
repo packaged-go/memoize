@@ -17,7 +17,7 @@ type params struct {
 
 func TestGetCachesWithinMinimumTTL(t *testing.T) {
 	var calls int32
-	m := memoize.New[string, params, int](
+	m := memoize.New[string, int, params](
 		func(ctx context.Context, key string, p params) (int, error) {
 			return int(atomic.AddInt32(&calls, 1)) + p.Offset, nil
 		},
@@ -46,12 +46,116 @@ func TestGetCachesWithinMinimumTTL(t *testing.T) {
 	}
 }
 
+func TestGetAllowsOmittedParams(t *testing.T) {
+	var calls int32
+	m := memoize.New[string, int, memoize.Params](
+		func(ctx context.Context, key string, p memoize.Params) (int, error) {
+			return len(key) + int(atomic.AddInt32(&calls, 1)), nil
+		},
+		memoize.WithMinimumTTL(time.Millisecond),
+	)
+	defer m.Close()
+
+	v, err := m.Get("key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != 4 {
+		t.Fatalf("expected key-derived value 4, got %d", v)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+
+	v, err = m.GetFresh("key")
+	if err != nil {
+		t.Fatalf("unexpected fresh error: %v", err)
+	}
+	if v != 5 {
+		t.Fatalf("expected refreshed key-derived value 5, got %d", v)
+	}
+}
+
+func TestNoParamsHelperCanBePassedExplicitly(t *testing.T) {
+	m := memoize.New[string, int, memoize.Params](
+		func(ctx context.Context, key string, p memoize.Params) (int, error) {
+			if p.Get("offset") != nil {
+				t.Fatal("expected empty params")
+			}
+			return len(key), nil
+		},
+	)
+	defer m.Close()
+
+	v, err := m.Get("key", memoize.NoParams())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != 3 {
+		t.Fatalf("expected key-derived value 3, got %d", v)
+	}
+}
+
+func TestNewKeyedAllowsKeyOnlySource(t *testing.T) {
+	var calls int32
+	m := memoize.NewKeyed[string, int](
+		func(ctx context.Context, key string) (int, error) {
+			return len(key) + int(atomic.AddInt32(&calls, 1)), nil
+		},
+		memoize.WithMinimumTTL(time.Hour),
+	)
+	defer m.Close()
+
+	v, err := m.Get("key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != 4 {
+		t.Fatalf("expected key-derived value 4, got %d", v)
+	}
+
+	v, err = m.Get("key")
+	if err != nil {
+		t.Fatalf("unexpected cached error: %v", err)
+	}
+	if v != 4 {
+		t.Fatalf("expected cached key-derived value 4, got %d", v)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected one source call, got %d", got)
+	}
+}
+
+func TestOmittedNilableParamsPassNil(t *testing.T) {
+	type optionalParams struct {
+		Offset int
+	}
+
+	m := memoize.New[string, int, *optionalParams](
+		func(ctx context.Context, key string, p *optionalParams) (int, error) {
+			if p == nil {
+				return len(key), nil
+			}
+			return len(key) + p.Offset, nil
+		},
+		memoize.WithMinimumTTL(0),
+	)
+	defer m.Close()
+
+	v, err := m.Get("key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != 3 {
+		t.Fatalf("expected nil params to produce 3, got %d", v)
+	}
+}
+
 func TestGetReturnsStaleWhenRefreshExceedsResponseTime(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var calls int32
 
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			call := atomic.AddInt32(&calls, 1)
 			if call == 1 {
@@ -96,8 +200,47 @@ func TestGetReturnsStaleWhenRefreshExceedsResponseTime(t *testing.T) {
 	}
 }
 
+func TestGetReturnsFreshWhenRefreshCompletesWithinResponseTime(t *testing.T) {
+	var calls int32
+	m := memoize.New[string, int, struct{}](
+		func(ctx context.Context, key string, p struct{}) (int, error) {
+			call := int(atomic.AddInt32(&calls, 1))
+			if call > 1 {
+				time.Sleep(10 * time.Millisecond)
+			}
+			return call, nil
+		},
+		memoize.WithMinimumTTL(5*time.Millisecond),
+		memoize.WithMaximumTTL(time.Hour),
+		memoize.WithMaximumResponseTime(time.Second),
+		memoize.WithHardTimeout(30*time.Second),
+	)
+	defer m.Close()
+
+	v, err := m.Get("k", struct{}{})
+	if err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+	if v != 1 {
+		t.Fatalf("expected first value 1, got %d", v)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	v, err = m.Get("k", struct{}{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != 2 {
+		t.Fatalf("expected refreshed value 2, got %d", v)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("expected two source calls, got %d", got)
+	}
+}
+
 func TestColdMissWaitsForSource(t *testing.T) {
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			time.Sleep(25 * time.Millisecond)
 			return 7, nil
@@ -116,7 +259,7 @@ func TestColdMissWaitsForSource(t *testing.T) {
 }
 
 func TestColdMissHardTimeout(t *testing.T) {
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			<-ctx.Done()
 			return 0, ctx.Err()
@@ -134,7 +277,7 @@ func TestColdMissHardTimeout(t *testing.T) {
 func TestColdMissHardTimeoutWhenSourceIgnoresContext(t *testing.T) {
 	release := make(chan struct{})
 	var calls int32
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			atomic.AddInt32(&calls, 1)
 			<-release
@@ -171,7 +314,7 @@ func TestTimedOutCallDoesNotBlockFutureFetches(t *testing.T) {
 	releaseFirst := make(chan struct{})
 	var calls int32
 	firstCtxDone := make(chan struct{})
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			call := atomic.AddInt32(&calls, 1)
 			if call == 1 {
@@ -222,7 +365,7 @@ func TestTimedOutCallDoesNotBlockFutureFetches(t *testing.T) {
 func TestErrorTTL(t *testing.T) {
 	errSource := errors.New("source failed")
 	var calls int32
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			atomic.AddInt32(&calls, 1)
 			return 0, memoize.WithErrorTTL(errSource, 20*time.Millisecond)
@@ -252,7 +395,7 @@ func TestErrorTTL(t *testing.T) {
 
 func TestSingleflightPerKey(t *testing.T) {
 	var calls int32
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			time.Sleep(10 * time.Millisecond)
 			atomic.AddInt32(&calls, 1)
@@ -284,7 +427,7 @@ func TestSingleflightPerKey(t *testing.T) {
 }
 
 func TestCleanupRemovesExpiredEntries(t *testing.T) {
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			return 1, nil
 		},
@@ -311,7 +454,7 @@ func TestCleanupRemovesExpiredEntries(t *testing.T) {
 }
 
 func TestBackgroundCleanupRemovesExpiredEntries(t *testing.T) {
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			return 1, nil
 		},
@@ -335,7 +478,7 @@ func TestBackgroundCleanupRemovesExpiredEntries(t *testing.T) {
 }
 
 func TestCloseIsIdempotent(t *testing.T) {
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			return 1, nil
 		},
@@ -348,7 +491,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 
 func TestCloseCancelsInFlightAndRejectsNewGets(t *testing.T) {
 	started := make(chan struct{})
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			close(started)
 			<-ctx.Done()
@@ -384,7 +527,7 @@ func TestCloseCancelsInFlightAndRejectsNewGets(t *testing.T) {
 func TestDeletePreventsInFlightResultFromRepopulatingCache(t *testing.T) {
 	release := make(chan struct{})
 	var calls int32
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			call := atomic.AddInt32(&calls, 1)
 			if call == 1 {
@@ -430,7 +573,7 @@ func TestDeletePreventsInFlightResultFromRepopulatingCache(t *testing.T) {
 func TestClearPreventsInFlightResultFromRepopulatingCache(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	m := memoize.New[string, struct{}, int](
+	m := memoize.New[string, int, struct{}](
 		func(ctx context.Context, key string, p struct{}) (int, error) {
 			close(started)
 			<-release
